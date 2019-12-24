@@ -3,16 +3,38 @@
 
 package com.microsoft.azure.servicebus.samples.topicsgettingstarted;
 
-import com.google.gson.reflect.TypeToken;
-import com.microsoft.azure.servicebus.*;
-import com.microsoft.azure.servicebus.primitives.ConnectionStringBuilder;
-import com.google.gson.Gson;
-import static java.nio.charset.StandardCharsets.*;
 import java.time.Duration;
-import java.util.*;
-import java.util.concurrent.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.function.Function;
-import org.apache.commons.cli.*;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import com.microsoft.azure.servicebus.ExceptionPhase;
+import com.microsoft.azure.servicebus.IMessage;
+import com.microsoft.azure.servicebus.IMessageSession;
+import com.microsoft.azure.servicebus.ISessionHandler;
+import com.microsoft.azure.servicebus.Message;
+import com.microsoft.azure.servicebus.ReceiveMode;
+import com.microsoft.azure.servicebus.SessionHandlerOptions;
+import com.microsoft.azure.servicebus.SubscriptionClient;
+import com.microsoft.azure.servicebus.TopicClient;
+import com.microsoft.azure.servicebus.primitives.ConnectionStringBuilder;
+import org.apache.commons.cli.BasicParser;
+import org.apache.commons.cli.CommandLine;
+import org.apache.commons.cli.CommandLineParser;
+import org.apache.commons.cli.HelpFormatter;
+import org.apache.commons.cli.Option;
+import org.apache.commons.cli.Options;
+
+import static java.nio.charset.StandardCharsets.*;
 
 public class TopicsGettingStarted {
 
@@ -33,21 +55,28 @@ public class TopicsGettingStarted {
         subscription3Client = new SubscriptionClient(new ConnectionStringBuilder(connectionString, "BasicTopic/subscriptions/Subscription3"), ReceiveMode.PEEKLOCK);
 
         ExecutorService executorService = Executors.newCachedThreadPool();
-        registerMessageHandlerOnClient(subscription1Client, executorService);
-        registerMessageHandlerOnClient(subscription2Client, executorService);
-        registerMessageHandlerOnClient(subscription3Client, executorService);
+        registerSessionHandlerOnClient(subscription1Client, executorService);
+        registerSessionHandlerOnClient(subscription2Client, executorService);
+        registerSessionHandlerOnClient(subscription3Client, executorService);
+
+        // 30S = default com.microsoft.azure.servicebus.ClientSettings.operationTimeout
+        for(int i = 1; i < 30; i++) {
+            System.out.println("Waiting... " + i);
+            Thread.sleep(1000);
+        }
+        System.out.println("Done waiting...");
 
         sendClient = new TopicClient(new ConnectionStringBuilder(connectionString, "BasicTopic"));
         sendMessagesAsync(sendClient).thenRunAsync(() -> sendClient.closeAsync());
 
         // wait for ENTER or 10 seconds elapsing
-        waitForEnter(10);
+        waitForEnter(120);
 
         CompletableFuture.allOf(
                 subscription1Client.closeAsync(),
                 subscription2Client.closeAsync(),
                 subscription3Client.closeAsync()).join();
-        
+
         executorService.shutdown();
     }
 
@@ -66,7 +95,7 @@ public class TopicsGettingStarted {
                                 "{'name' = 'Kepler', 'firstName' = 'Johannes'}," +
                                 "{'name' = 'Kopernikus', 'firstName' = 'Nikolaus'}" +
                                 "]",
-                        new TypeToken<List<HashMap<String, String>>>() {
+                                new TypeToken<List<HashMap<String, String>>>() {
                         }.getType());
 
         List<CompletableFuture> tasks = new ArrayList<>();
@@ -75,8 +104,9 @@ public class TopicsGettingStarted {
             Message message = new Message(GSON.toJson(data.get(i), Map.class).getBytes(UTF_8));
             message.setContentType("application/json");
             message.setLabel("Scientist");
-            message.setMessageId(messageId);
-            message.setTimeToLive(Duration.ofMinutes(2));
+            message.setMessageId(UUID.randomUUID().toString());
+            message.setTimeToLive(Duration.ofMinutes(5));
+            message.setSessionId("my-session");
             System.out.printf("Message sending: Id = %s\n", message.getMessageId());
             tasks.add(
                     sendClient.sendAsync(message).thenRunAsync(() -> {
@@ -86,13 +116,13 @@ public class TopicsGettingStarted {
         return CompletableFuture.allOf(tasks.toArray(new CompletableFuture<?>[tasks.size()]));
     }
 
-    void registerMessageHandlerOnClient(SubscriptionClient receiveClient, ExecutorService executorService) throws Exception {
+    void registerSessionHandlerOnClient(SubscriptionClient receiveClient, ExecutorService executorService) throws Exception {
 
         // register the RegisterMessageHandler callback
-        receiveClient.registerMessageHandler(
-                new IMessageHandler() {
+        receiveClient.registerSessionHandler(
+                new ISessionHandler() {
                     // callback invoked when the message handler loop has obtained a message
-                    public CompletableFuture<Void> onMessageAsync(IMessage message) {
+                    public CompletableFuture<Void> onMessageAsync(IMessageSession session, IMessage message) {
                         // receives message is passed to callback
                         if (message.getLabel() != null &&
                                 message.getContentType() != null &&
@@ -105,25 +135,37 @@ public class TopicsGettingStarted {
                             System.out.printf(
                                     "\n\t\t\t\t%s Message received: \n\t\t\t\t\t\tMessageId = %s, \n\t\t\t\t\t\tSequenceNumber = %s, \n\t\t\t\t\t\tEnqueuedTimeUtc = %s," +
                                             "\n\t\t\t\t\t\tExpiresAtUtc = %s, \n\t\t\t\t\t\tContentType = \"%s\",  \n\t\t\t\t\t\tContent: [ firstName = %s, name = %s ]\n",
-                                    receiveClient.getEntityPath(),
-                                    message.getMessageId(),
-                                    message.getSequenceNumber(),
-                                    message.getEnqueuedTimeUtc(),
-                                    message.getExpiresAtUtc(),
-                                    message.getContentType(),
-                                    scientist != null ? scientist.get("firstName") : "",
-                                    scientist != null ? scientist.get("name") : "");
+                                            receiveClient.getEntityPath(),
+                                            message.getMessageId(),
+                                            message.getSequenceNumber(),
+                                            message.getEnqueuedTimeUtc(),
+                                            message.getExpiresAtUtc(),
+                                            message.getContentType(),
+                                            scientist != null ? scientist.get("firstName") : "",
+                                                    scientist != null ? scientist.get("name") : "");
                         }
-                        return receiveClient.completeAsync(message.getLockToken());
+
+                        try {
+                            session.complete(message.getLockToken());
+                        } catch (Exception e) {
+                            System.err.println(e);
+                        }
+
+                        return CompletableFuture.completedFuture(null);
                     }
 
                     // callback invoked when the message handler has an exception to report
                     public void notifyException(Throwable throwable, ExceptionPhase exceptionPhase) {
                         System.out.printf(exceptionPhase + "-" + throwable.getMessage());
                     }
+
+                    @Override
+                    public CompletableFuture<Void> OnCloseSessionAsync(IMessageSession session) {
+                        return CompletableFuture.completedFuture(null);
+                    }
                 },
                 // 1 concurrent call, messages are auto-completed, auto-renew duration
-                new MessageHandlerOptions(1, false, Duration.ofMinutes(1)),
+                new SessionHandlerOptions(1, false, Duration.ofMinutes(1)),
                 executorService);
 
     }
@@ -152,7 +194,7 @@ public class TopicsGettingStarted {
             // parse connection string from command line
             Options options = new Options();
             options.addOption(new Option("c", true, "Connection string"));
-            CommandLineParser clp = new DefaultParser();
+            CommandLineParser clp = new BasicParser();
             CommandLine cl = clp.parse(options, args);
             if (cl.getOptionValue("c") != null) {
                 connectionString = cl.getOptionValue("c");
